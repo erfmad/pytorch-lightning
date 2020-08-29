@@ -43,21 +43,29 @@ except ImportError:
 
 class DDPBackend(Accelerator):
 
-    def __init__(self, trainer):
+    def __init__(self, trainer, mode: str = 'ddp'):
         super().__init__(trainer)
         self.task_idx = None
         self._has_spawned_children = False
+        self.mode = mode
 
-    def slurm_setup(self):
+    def setup(self, model):
+        if self.mode == 'ddp':
+            self.__ddp_script_mode_setup()
+        elif self.mode == 'slurm_ddp':
+            self.__slurm_setup()
+        elif self.mode == 'torchelastic_ddp':
+            self.__torchelastic_setup()
+
+        self.trainer.model = model
+
+    def __slurm_setup(self):
         self.task_idx = int(os.environ['SLURM_LOCALID'])
 
-    def torchelastic_setup(self):
+    def __torchelastic_setup(self):
         self.task_idx = int(os.environ['LOCAL_RANK'])
 
-    def train(self, model):
-        self.ddp_train(process_idx=self.task_idx, mp_queue=None, model=model)
-
-    def spawn_ddp_children(self, model):
+    def __ddp_script_mode_setup(self):
         assert self.trainer.global_rank == 0
         self._check_can_spawn_children()
         self._has_spawned_children = True
@@ -120,11 +128,16 @@ class DDPBackend(Accelerator):
             delay = np.random.uniform(1, 5, 1)[0]
             sleep(delay)
 
-        local_rank = 0
-        results = self.ddp_train(local_rank, mp_queue=None, model=model, is_master=True)
-        del os.environ['WORLD_SIZE']
+        self.task_idx = 0
 
-        return results
+    def train(self):
+        model = self.trainer.model
+        if self.mode == 'ddp':
+            results = self.ddp_train(process_idx=self.task_idx, mp_queue=None, model=model, is_master=True)
+            del os.environ['WORLD_SIZE']
+            return results
+        else:
+            self.ddp_train(process_idx=self.task_idx, mp_queue=None, model=model)
 
     def ddp_train(self, process_idx, mp_queue, model, is_master=False, proc_offset=0):
         """

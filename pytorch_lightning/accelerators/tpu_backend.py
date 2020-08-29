@@ -41,7 +41,7 @@ class TPUBackend(Accelerator):
         self.start_method = None
         self.mp_queue = None
 
-    def setup(self):
+    def setup(self, model):
         rank_zero_info(f'training on {self.trainer.tpu_cores} TPU cores')
 
         if not XLA_AVAILABLE:
@@ -54,7 +54,11 @@ class TPUBackend(Accelerator):
         smp = mp.get_context(self.start_method)
         self.mp_queue = smp.SimpleQueue()
 
-    def teardown(self, model):
+        self.trainer.model = model
+
+    def teardown(self):
+        model = self.trainer.model
+
         # restore main state with best weights
         best_path = self.mp_queue.get()
         results = self.mp_queue.get()
@@ -75,8 +79,8 @@ class TPUBackend(Accelerator):
         self.__load_weights_on_main_process()
         return results
 
-    def train(self, model: LightningModule):
-        self.trainer.model = model
+    def train(self):
+        model = self.trainer.model
 
         # train
         if self.trainer.tpu_id is not None:

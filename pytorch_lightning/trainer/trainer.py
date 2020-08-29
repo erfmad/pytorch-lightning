@@ -981,32 +981,17 @@ class Trainer(
         if hasattr(model, 'hparams'):
             parsing.clean_namespace(model.hparams)
 
-        # if a datamodule comes in as the second arg, then fix it for the user
-        if isinstance(train_dataloader, LightningDataModule):
-            datamodule = train_dataloader
-            train_dataloader = None
-
-        self.config_validator.enforce_datamodule_dataloader_override(train_dataloader, val_dataloaders, datamodule)
-
-        # set up the passed in dataloaders (if needed)
-        self.__attach_dataloaders(model, train_dataloader, val_dataloaders)
-        self.__attach_datamodule(model, datamodule, 'fit')
+        # links data to the trainer
+        self.attach_data(model, train_dataloader, val_dataloaders, datamodule)
 
         # check that model is configured correctly
         self.config_validator.verify_loop_configurations(model)
 
-        # callbacks
-        self.on_fit_start(model)
-        if self.is_function_implemented('on_fit_start', model):
-            model.on_fit_start()
+        # hook
+        self.call_hook('on_fit_start', model)
 
-        # on multi-gpu jobs we only want to manipulate (download, etc) on node_rank=0, local_rank=0
-        # or in the case where each node needs to do its own manipulation in which case just local_rank=0
-        if self.can_prepare_data():
-            if self.datamodule is not None:
-                self.datamodule.prepare_data()
-            model.prepare_data()
-            self._is_data_prepared = True
+        # hook
+        self.prepare_data(model)
 
         # Run auto batch size scaling
         if self.auto_scale_batch_size:
@@ -1023,9 +1008,51 @@ class Trainer(
         # set testing if set in environ
         self.testing = os.environ.get('PL_TESTING_MODE', self.testing)
 
-        # -------------------
-        # determine ddp mode
-        # -------------------
+        # -------------------------
+        # TRAIN
+        # -------------------------
+        self.accelerator_backend = self.select_accelerator()
+        self.accelerator_backend.setup(model)
+        results = self.accelerator_backend.train()
+        self.accelerator_backend.teardown()
+
+        # -------------------------
+        # POST-Training
+        # -------------------------
+        # hook
+        self.call_hook('on_fit_end')
+
+        # hook
+        self.teardown('fit')
+        if self.is_function_implemented('teardown'):
+            model.teardown('fit')
+
+        # return 1 when finished
+        # used for testing or when we need to know that training succeeded
+        return results or 1
+
+    def prepare_data(self, model):
+        # on multi-gpu jobs we only want to manipulate (download, etc) on node_rank=0, local_rank=0
+        # or in the case where each node needs to do its own manipulation in which case just local_rank=0
+        if self.can_prepare_data():
+            if self.datamodule is not None:
+                self.datamodule.prepare_data()
+            model.prepare_data()
+            self._is_data_prepared = True
+
+    def attach_data(self, model, train_dataloader, val_dataloaders, datamodule):
+        # if a datamodule comes in as the second arg, then fix it for the user
+        if isinstance(train_dataloader, LightningDataModule):
+            datamodule = train_dataloader
+            train_dataloader = None
+
+        self.config_validator.enforce_datamodule_dataloader_override(train_dataloader, val_dataloaders, datamodule)
+
+        # set up the passed in dataloaders (if needed)
+        self.__attach_dataloaders(model, train_dataloader, val_dataloaders)
+        self.__attach_datamodule(model, datamodule, 'fit')
+
+    def select_accelerator(self):
         # SLURM ddp
         use_slurm_ddp = self.use_ddp and self.is_slurm_managing_tasks
 
@@ -1035,79 +1062,38 @@ class Trainer(
 
         use_ddp_spawn = self.use_ddp and self.distributed_backend in ['ddp_cpu', 'ddp_spawn']
 
-        # -------------------
-        # route training mode
-        # -------------------
-        # DDP2 (cluster only)
+        # choose the appropriate accelerator backend
         if self.use_ddp2:
-            self.accelerator_backend = DDP2Backend(self)
-            self.accelerator_backend.setup()
-            self.accelerator_backend.train(model)
+            accelerator_backend = DDP2Backend(self)
 
         elif use_slurm_ddp:
-            self.accelerator_backend = DDPBackend(self)
-            self.accelerator_backend.slurm_setup()
-            self.accelerator_backend.train(model)
+            accelerator_backend = DDPBackend(self, mode='slurm_ddp')
 
         elif use_torchelastic_ddp:
-            self.accelerator_backend = DDPBackend(self)
-            self.accelerator_backend.torchelastic_setup()
-            self.accelerator_backend.train(model)
+            accelerator_backend = DDPBackend(self, mode='torchelastic_ddp')
 
-        # regular ddp using .spawn
         elif use_ddp_spawn:
-            self.accelerator_backend = DDPSpawnBackend(self)
-            self.accelerator_backend.setup()
-            self.accelerator_backend.train(model, nprocs=self.num_processes)
-            results = self.accelerator_backend.teardown(model)
+            accelerator_backend = DDPSpawnBackend(self, nprocs=self.num_processes)
 
-        # ddp
         elif self.distributed_backend == 'ddp':
-            self.accelerator_backend = DDPBackend(self)
-            results = self.accelerator_backend.spawn_ddp_children(model)
+            accelerator_backend = DDPBackend(self, mode='ddp')
 
-        # dp
         elif self.use_dp:
-            self.accelerator_backend = DataParallelBackend(self)
-            self.accelerator_backend.setup(model)
-            results = self.accelerator_backend.train()
-            self.accelerator_backend.teardown()
+            accelerator_backend = DataParallelBackend(self)
 
         elif self.use_horovod:
-            self.accelerator_backend = HorovodBackend(self)
-            self.accelerator_backend.setup(model)
-            results = self.accelerator_backend.train()
-            self.accelerator_backend.teardown()
+            accelerator_backend = HorovodBackend(self)
 
         elif self.use_single_gpu:
-            self.accelerator_backend = GPUBackend(self)
-            model = self.accelerator_backend.setup(model)
-            results = self.accelerator_backend.train(model)
+            accelerator_backend = GPUBackend(self)
 
         elif self.use_tpu:
-            self.accelerator_backend = TPUBackend(self)
-            self.accelerator_backend.setup()
-            self.accelerator_backend.train(model)
-            self.accelerator_backend.teardown(model)
+            accelerator_backend = TPUBackend(self)
 
         else:
-            self.accelerator_backend = CPUBackend(self)
-            self.accelerator_backend.setup(model)
-            results = self.accelerator_backend.train(model)
+            accelerator_backend = CPUBackend(self)
 
-        # on fit end callback
-        self.on_fit_end()
-        if self.is_function_implemented('on_fit_end'):
-            model.on_fit_end()
-
-        # teardown callback
-        self.teardown('fit')
-        if self.is_function_implemented('teardown'):
-            model.teardown('fit')
-
-        # return 1 when finished
-        # used for testing or when we need to know that training succeeded
-        return results or 1
+        return accelerator_backend
 
     def can_prepare_data(self):
         should_call_dm_prepare_data = True
@@ -1266,7 +1252,8 @@ class Trainer(
             self.running_sanity_check = True
             self.on_sanity_check_start()
 
-            eval_results = self._evaluate(model, self.val_dataloaders, self.num_sanity_val_batches, False)
+            # run eval step
+            _, eval_results = self.run_evaluation(test_mode=False, max_batches=self.num_sanity_val_batches)
 
             # allow no returns from eval
             if eval_results is not None and len(eval_results) > 0:

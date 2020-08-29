@@ -269,7 +269,7 @@ class ModelCheckpoint(Callback):
         return filepath
 
     @rank_zero_only
-    def on_train_start(self, trainer, pl_module):
+    def on_pretrain_routine_start(self, trainer, pl_module):
         """
         Determines model checkpoint save directory at runtime. References attributes from the
         trainer's logger to determine where to save checkpoints.
@@ -328,6 +328,9 @@ class ModelCheckpoint(Callback):
     def on_validation_end(self, trainer, pl_module):
         # only run on main process
         if trainer.global_rank != 0:
+            return
+
+        if trainer.running_sanity_check:
             return
 
         # TODO: remove when dict results are deprecated
@@ -423,3 +426,13 @@ class ModelCheckpoint(Callback):
         for cur_path in del_list:
             if cur_path != filepath:
                 self._del_model(cur_path)
+
+    def on_save_checkpoint(self, trainer, pl_module):
+        return {
+            'best_model_score': self.best_model_score,
+            'best_model_path': self.best_model_path,
+        }
+
+    def on_load_checkpoint(self, checkpointed_state):
+        self.best_model_score = checkpointed_state['best_model_score']
+        self.best_model_path = checkpointed_state['best_model_path']

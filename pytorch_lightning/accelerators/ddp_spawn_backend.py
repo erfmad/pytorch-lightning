@@ -29,30 +29,40 @@ except ImportError:
 
 class DDPSpawnBackend(Accelerator):
 
-    def __init__(self, trainer):
+    def __init__(self, trainer, nprocs):
         super().__init__(trainer)
         self.mp_queue = None
+        self.nprocs = nprocs
 
-    def setup(self):
+    def setup(self, model):
         os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', str(find_free_network_port()))
 
         # pass in a state q
         smp = mp.get_context('spawn')
         self.mp_queue = smp.SimpleQueue()
 
-    def train(self, model, nprocs):
-        mp.spawn(self.ddp_train, nprocs=nprocs, args=(self.mp_queue, model,))
+        self.trainer.model = model
 
-    def teardown(self, model):
+    def train(self):
+        model = self.trainer.model
+
+        # train in children process
+        mp.spawn(self.ddp_train, nprocs=self.nprocs, args=(self.mp_queue, model,))
+
         # restore main state with best weights
         best_path = self.mp_queue.get()
         results = self.mp_queue.get()
         last_path = self.mp_queue.get()
 
+        # recover the weights of the processes trained in the children
+        self.__recover_child_process_weights(model, best_path, last_path)
+        return results
+
+    def __recover_child_process_weights(self, model, best_path, last_path):
         # transfer back the best path to the trainer
         if self.trainer.checkpoint_callback:
             self.trainer.checkpoint_callback.best_model_path = best_path
-        # todo, pass also bets score
+        # todo, pass also best score
 
         # load last weights
         if last_path is not None and not self.trainer.testing:
@@ -60,7 +70,6 @@ class DDPSpawnBackend(Accelerator):
             model.load_state_dict(ckpt)
 
         self.trainer.model = model
-        return results
 
     def ddp_train(self, process_idx, mp_queue, model):
         """

@@ -8,6 +8,12 @@ class Accelerator(object):
     def __init__(self, trainer):
         self.trainer = trainer
 
+    def setup(self, model):
+        pass
+
+    def teardown(self):
+        pass
+
     def batch_to_device(self, batch: Any, device: torch.device):
         model = self.trainer.get_model()
         if model is not None:
